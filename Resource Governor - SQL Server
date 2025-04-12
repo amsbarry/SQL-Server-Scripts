@@ -1,0 +1,213 @@
+-- ======================================================================
+-- == Configure Resource Governor to Limit Resource-Hungry Queries     ==
+-- == Target Server: 20 CPUs, 128 GB RAM                             ==
+-- == WARNING: TEST THOROUGHLY BEFORE PRODUCTION IMPLEMENTATION!       ==
+-- ======================================================================
+
+-- Connect to the master database to create the classifier function
+USE master;
+GO
+
+-- Disable Resource Governor temporarily to make changes
+ALTER RESOURCE GOVERNOR DISABLE;
+GO
+
+-- ======================================================================
+-- 1. Create the Resource Pool for Limited Queries
+-- ======================================================================
+-- Check if the pool already exists
+IF NOT EXISTS (SELECT 1 FROM sys.resource_governor_resource_pools WHERE name = N'LimitedQueryPool')
+BEGIN
+    -- Create the pool
+    -- MAX_CPU_PERCENT: Cap CPU usage for this pool (e.g., 20% of total CPU)
+    -- MAX_MEMORY_PERCENT: Cap Memory usage for this pool (e.g., 15% of total buffer pool memory)
+    -- MIN values are often 0 for low-priority pools, meaning no guarantee under pressure.
+    CREATE RESOURCE POOL LimitedQueryPool
+    WITH (
+        MIN_CPU_PERCENT = 0,        -- No guaranteed minimum CPU
+        MAX_CPU_PERCENT = 20,       -- Max 20% of total CPU capacity for this pool
+        MIN_MEMORY_PERCENT = 0,     -- No guaranteed minimum memory
+        MAX_MEMORY_PERCENT = 15,    -- Max 15% of total server memory grant capacity
+        CAP_CPU_PERCENT = 25       -- Optional: Hard cap at 25% even if server CPU is idle (Use MAX_CPU_PERCENT first)
+        -- IO Limits (Optional - Requires careful benchmarking of your storage first)
+        -- , MIN_IOPS_PER_VOLUME = 0
+        -- , MAX_IOPS_PER_VOLUME = 100 -- Example: Limit to 100 IOPS per disk volume
+    );
+    PRINT 'Resource Pool [LimitedQueryPool] created.';
+END
+ELSE
+BEGIN
+    -- Optionally alter existing pool if needed (adjust limits here)
+    ALTER RESOURCE POOL LimitedQueryPool
+    WITH (
+        MAX_CPU_PERCENT = 20,
+        MAX_MEMORY_PERCENT = 15
+        -- Add or modify other parameters as needed
+    );
+     PRINT 'Resource Pool [LimitedQueryPool] already exists, limits potentially updated.';
+END
+GO
+
+-- ======================================================================
+-- 2. Create the Workload Group for Limited Queries
+-- ======================================================================
+-- Check if the group already exists
+IF NOT EXISTS (SELECT 1 FROM sys.resource_governor_workload_groups WHERE name = N'LimitedQueryGroup')
+BEGIN
+    -- Create the group and assign it to the pool
+    -- IMPORTANCE: Low priority compared to Medium (default) or High
+    -- REQUEST_MAX_MEMORY_GRANT_PERCENT: Max memory a SINGLE query can get (as % of POOL'S memory limit)
+    -- MAX_DOP: Limit parallelism for queries in this group
+    -- REQUEST_MEMORY_GRANT_TIMEOUT_SEC: How long a query waits for memory before timing out
+    CREATE WORKLOAD GROUP LimitedQueryGroup
+    WITH (
+        IMPORTANCE = Low,
+        REQUEST_MAX_MEMORY_GRANT_PERCENT = 25, -- Max 25% of the POOL's memory limit (15% of total) per query
+        REQUEST_MEMORY_GRANT_TIMEOUT_SEC = 30, -- Timeout if waiting > 30 seconds for memory grant
+        MAX_DOP = 4                             -- Limit parallelism to 4 CPUs (adjust based on testing)
+        -- , GROUP_MAX_REQUESTS = 5              -- Optional: Limit concurrent requests in this group
+    )
+    USING LimitedQueryPool; -- Assign this group to the pool created above
+    PRINT 'Workload Group [LimitedQueryGroup] created.';
+END
+ELSE
+BEGIN
+     -- Optionally alter existing group if needed
+     ALTER WORKLOAD GROUP LimitedQueryGroup
+     WITH (
+        REQUEST_MAX_MEMORY_GRANT_PERCENT = 25,
+        REQUEST_MEMORY_GRANT_TIMEOUT_SEC = 30,
+        MAX_DOP = 4
+        -- Add or modify other parameters as needed
+     )
+     USING LimitedQueryPool;
+     PRINT 'Workload Group [LimitedQueryGroup] already exists, settings potentially updated.';
+END
+GO
+
+
+-- ======================================================================
+-- 3. Create or Alter the Classifier Function
+-- ======================================================================
+-- This function determines which workload group a session is assigned to.
+-- Customize the logic inside based on how you identify problematic sessions.
+
+IF OBJECT_ID('dbo.udf_ResourceGovernorClassifier', 'FN') IS NOT NULL
+BEGIN
+    DROP FUNCTION dbo.udf_ResourceGovernorClassifier;
+    PRINT 'Existing Classifier Function [dbo.udf_ResourceGovernorClassifier] dropped.';
+END
+GO
+
+CREATE FUNCTION dbo.udf_ResourceGovernorClassifier()
+RETURNS sysname
+WITH SCHEMABINDING -- Required for classifier functions
+AS
+BEGIN
+    DECLARE @WorkloadGroup sysname;
+
+    -- Default to the 'default' group for most connections
+    SET @WorkloadGroup = N'default';
+
+    -- ============================================================
+    -- == !! CUSTOMIZE YOUR CLASSIFICATION LOGIC HERE !! ==
+    -- ============================================================
+    -- Example 1: Assign specific logins
+    IF SUSER_SNAME() IN (N'RiskyUserLogin1', N'AdHocQueryUser')
+    BEGIN
+        SET @WorkloadGroup = N'LimitedQueryGroup';
+    END
+
+    -- Example 2: Assign specific application names
+    -- (Application name is set in the connection string)
+    -- ELSE IF APP_NAME() LIKE N'%ReportingTool%' OR APP_NAME() = N'PowerBIAdhoc'
+    -- BEGIN
+    --     SET @WorkloadGroup = N'LimitedQueryGroup';
+    -- END
+
+    -- Example 3: Assign specific host names
+    -- ELSE IF HOST_NAME() IN (N'DEVELOPER_PC1', N'ANALYST_MACHINE')
+    -- BEGIN
+    --     SET @WorkloadGroup = N'LimitedQueryGroup';
+    -- END
+
+    -- Example 4: Assign based on database connection (Less common for classification)
+    -- Note: ORIGINAL_DB_NAME() gets the initial database, not necessarily the current one.
+    -- ELSE IF ORIGINAL_DB_NAME() = N'StagingDatabase'
+    -- BEGIN
+    --    SET @WorkloadGroup = N'LimitedQueryGroup';
+    -- END
+
+    -- IMPORTANT: Make sure internal/system connections are NOT classified into your limited group
+    -- Typically, letting them fall through to 'default' is correct.
+    -- The 'internal' group handles system tasks automatically.
+
+    RETURN @WorkloadGroup;
+END;
+GO
+PRINT 'Classifier Function [dbo.udf_ResourceGovernorClassifier] created/updated.';
+
+
+-- ======================================================================
+-- 4. Configure Resource Governor to use the Classifier Function
+-- ======================================================================
+ALTER RESOURCE GOVERNOR WITH (CLASSIFIER_FUNCTION = dbo.udf_ResourceGovernorClassifier);
+GO
+PRINT 'Resource Governor configured to use the classifier function.';
+
+-- ======================================================================
+-- 5. Re-enable Resource Governor
+-- ======================================================================
+ALTER RESOURCE GOVERNOR RECONFIGURE;
+GO
+PRINT 'Resource Governor reconfigured and enabled.';
+PRINT 'Configuration complete. Monitor server performance and Resource Governor DMVs.';
+
+
+-- ======================================================================
+-- == Monitoring Commands (Run these periodically)                     ==
+-- ======================================================================
+/*
+-- View current pool configuration and runtime stats
+SELECT * FROM sys.dm_resource_governor_resource_pools;
+
+-- View current group configuration and runtime stats
+SELECT * FROM sys.dm_resource_governor_workload_groups;
+
+-- View active requests and their assigned group/pool
+SELECT
+    r.session_id,
+    r.status,
+    r.command,
+    r.wait_type,
+    r.wait_time,
+    r.cpu_time,
+    r.total_elapsed_time,
+    r.reads,
+    r.writes,
+    r.logical_reads,
+    mg.granted_memory_kb / 1024.0 AS granted_memory_mb,
+    mg.ideal_memory_kb / 1024.0 AS ideal_memory_mb,
+    mg.query_cost,
+    mg.dop,
+    wg.name AS workload_group_name,
+    rp.name AS resource_pool_name,
+    SUBSTRING(qt.text, (r.statement_start_offset/2)+1,
+        ((CASE r.statement_end_offset
+          WHEN -1 THEN DATALENGTH(qt.text)
+         ELSE r.statement_end_offset
+         END - r.statement_start_offset)/2) + 1) AS sql_statement
+FROM sys.dm_exec_requests r
+LEFT JOIN sys.dm_exec_query_memory_grants mg ON r.session_id = mg.session_id AND r.request_id = mg.request_id
+LEFT JOIN sys.dm_resource_governor_workload_groups wg ON r.group_id = wg.group_id
+LEFT JOIN sys.dm_resource_governor_resource_pools rp ON wg.pool_id = rp.pool_id
+CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) AS qt
+WHERE r.session_id > 50 -- Filter out system sessions
+ORDER BY r.total_elapsed_time DESC;
+
+-- Check for memory grant waits related to resource pools
+SELECT * FROM sys.dm_os_wait_stats WHERE wait_type LIKE 'RESOURCE_SEMAPHORE%';
+
+-- Check Resource Governor specific Perfmon counters (e.g., SQLServer:Workload Group Stats, SQLServer:Resource Pool Stats)
+-- Look for counters like CPU usage %, Memory grant timeouts/sec, Queued requests, Requests completed/sec etc. for your specific group/pool.
+*/
